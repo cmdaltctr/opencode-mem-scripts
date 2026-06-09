@@ -160,3 +160,7 @@ Default paths (override by editing the constants at the top of each script):
 - `backfill-memories.py` and `backfill-profile.py` need no keys — they talk to the
   locally running opencode-mem plugin.
 - No credentials are hardcoded. `.env` is in `.gitignore`.
+
+## License
+
+MIT © 2026 Dr. Muhammad Aizat Md Hawari — see [LICENSE](LICENSE).
