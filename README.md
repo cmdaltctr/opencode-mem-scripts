@@ -11,6 +11,10 @@ user profile.
 - **Python 3.9+** (no extra packages needed — stdlib only)
 - **Ollama** running (for the embedding model; only needed by the plugin, not these scripts)
 
+> **Platform note:** These scripts have only been tested on macOS (Apple Silicon).
+> They use standard Python stdlib only, so they should work on Linux/Windows too,
+> but we have not verified this. Pull requests welcome.
+
 ## Scripts
 
 ### 1. `backfill-memories.py` — Import session memories
