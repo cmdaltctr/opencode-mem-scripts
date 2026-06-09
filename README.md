@@ -64,11 +64,19 @@ Calls an AI provider directly (bypassing the plugin's scheduler) to analyse your
 prompts and build a user profile. Useful when the plugin's `performUserProfileLearning`
 hasn't triggered yet, or to rebuild specific aspects of the profile.
 
-```bash
-# Set your API key (pick one method):
-export DEEPSEEK_API_KEY="sk-..."
-python3 build-profile.py --api-key "sk-..."
+**Setup (one-time):** copy `.env.example` → `.env` and fill in your key + model:
 
+```bash
+cp .env.example .env
+# edit .env:
+#   DEEPSEEK_API_KEY=sk-...
+#   PROFILE_API_URL=https://api.deepseek.com/v1/chat/completions
+#   PROFILE_MODEL=deepseek-v4-flash
+```
+
+**Run:**
+
+```bash
 # Build all three aspects (preferences + patterns + workflows)
 python3 build-profile.py
 
@@ -76,6 +84,13 @@ python3 build-profile.py
 python3 build-profile.py --aspect preferences
 python3 build-profile.py --aspect patterns
 python3 build-profile.py --aspect workflows
+```
+
+**Override at runtime (without touching `.env`):**
+
+```bash
+python3 build-profile.py --api-key "sk-..."   # key only
+PROFILE_API_URL=https://api.openai.com/v1 PROFILE_MODEL=gpt-4o-mini python3 build-profile.py
 ```
 
 **What it does:**
