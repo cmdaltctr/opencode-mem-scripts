@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Build user profile workflows by analysing prompts with DeepSeek V4 Flash."""
+"""Build user profile (preferences + patterns + workflows) by analysing prompts.
+
+Reads prompts from opencode-mem's user-prompts.db, calls the configured AI provider
+in batches, and writes the result to user-profiles.db. Uses the plugin's expected
+field names so the web UI renders correctly:
+
+  preferences: {category, description, confidence, evidence[], lastUpdated}
+  patterns:    {category, description, frequency, lastSeen}
+  workflows:   {description, steps[], frequency}
+"""
 
 import sqlite3, json, os, time, hashlib, argparse
 from urllib.request import Request, urlopen
@@ -10,45 +19,113 @@ API_URL        = os.environ.get("PROFILE_API_URL", "https://api.deepseek.com/v1/
 MODEL          = os.environ.get("PROFILE_MODEL", "deepseek-v4-flash")
 BATCH_SIZE     = 100  # prompts per API call
 
-SYSTEM_PROMPT = """You are a user profile analyser. Analyse the conversation prompts
-to extract the user's development WORKFLOWS — their habits, sequences, and
-repeating behaviours.
-
-A workflow is a pattern of HOW they work, not WHAT they work on. Examples:
-- "delegates research to parallel subagents before coding"
-- "always writes tests before implementation (TDD)"
-- "commits after every incremental step, not in bulk"
-- "reads entire codebase structure before making edits"
-- "validates config changes with grep/diff before applying"
-- "writes documentation alongside code, never after"
-- "starts with dry-run/plan before executing changes"
-- "uses structured back-and-forth debugging (hypothesis → test → fix)"
-- "always specifies model and provider explicitly for agents"
-- "inspects generated code before accepting it"
+PREFERENCES_PROMPT = """You are a user profile analyser. Analyse the conversation
+prompts and extract the user's stable PREFERENCES — code style, communication style,
+tool choices, frameworks, architecture choices.
 
 Return ONLY valid JSON — no markdown:
 {
-  "workflows": [
-    {"habit": "description of workflow",
-     "frequency": "low|medium|high",
-     "evidence": "short excerpt from prompts showing this habit"}
+  "preferences": [
+    {
+      "category": "code-style|communication|tools|languages|frameworks|architecture|workflow|process",
+      "description": "specific, observable preference (e.g. 'prefers TypeScript over JavaScript')",
+      "confidence": 0.5-1.0
+    }
   ]
 }
 
 Rules:
-- Extract 5-10 workflows
-- Look for ACTION SEQUENCES, not topics
-- frequency = how consistently observed
-- evidence = one-line quote from the prompts
+- Extract 5-10 preferences
+- Confidence based on how clearly the preference is expressed
+- Skip vague/generic observations
+- description should be 1 sentence, under 100 chars
 """
 
+PATTERNS_PROMPT = """You are a user profile analyser. Analyse the conversation prompts
+and extract the user's PATTERNS — recurring topics, problem domains, and technical
+interests they engage with frequently.
 
-def call_api(batch, api_key):
+Return ONLY valid JSON — no markdown:
+{
+  "patterns": [
+    {
+      "category": "topic|domain|technology|skill",
+      "description": "name of the recurring pattern (e.g. 'MCP server development and configuration')",
+      "frequency": 0.0-1.0
+    }
+  ]
+}
+
+Rules:
+- Extract 5-10 patterns
+- frequency = how often this topic appears across the prompts
+- description is the pattern name, 2-6 words
+"""
+
+WORKFLOWS_PROMPT = """You are a user profile analyser. Analyse the conversation prompts
+to extract the user's development WORKFLOWS — their habits, sequences, and
+repeating behaviours.
+
+Return ONLY valid JSON — no markdown:
+{
+  "workflows": [
+    {
+      "description": "short name of the workflow",
+      "steps": ["step 1", "step 2", "step 3"],
+      "frequency": 0.0-1.0
+    }
+  ]
+}
+
+Field rules:
+- description: 3-8 word summary
+- steps: 2-5 concrete actions in order, each under 80 chars
+- frequency: how consistently observed (0.0 = rarely, 1.0 = always)
+
+Example:
+- {"description": "Parallel subagent delegation", "steps": ["Identify independent subtasks", "Launch subagents simultaneously", "Merge findings"], "frequency": 0.95}
+
+Extract 5-10 workflows."""
+
+
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key, val = key.strip(), val.strip().strip("'\"")
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
+def _resolve_api_key(flag_key: str) -> str:
+    if flag_key:
+        return flag_key
+    for var in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"):
+        val = os.environ.get(var, "")
+        if val:
+            return val
+    auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
+    try:
+        with open(auth_path) as f:
+            auth = json.load(f)
+            return auth.get("deepseek", {}).get("key", "")
+    except Exception:
+        pass
+    return ""
+
+
+def call_api(batch, system_prompt, api_key):
     payload = {
         "model": MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "Extract workflows from these:\n\n"
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "Analyse these prompts:\n\n"
              + "\n---\n".join(p[1][:800] for p in batch)}
         ],
         "temperature": 0.1,
@@ -70,130 +147,126 @@ def call_api(batch, api_key):
     return None
 
 
-def get_existing_profile():
+def get_prompts():
+    conn = sqlite3.connect(USER_PROMPTS_DB)
+    c = conn.cursor()
+    c.execute("SELECT id, content FROM user_prompts WHERE user_learning_captured = 0")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def get_active_profile():
     conn = sqlite3.connect(PROFILES_DB)
     c = conn.cursor()
-    c.execute("SELECT profile_data, id FROM user_profiles WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1")
+    c.execute("SELECT id, profile_data FROM user_profiles WHERE is_active = 1 ORDER BY created_at DESC LIMIT 1")
     row = c.fetchone()
     conn.close()
-    if row:
-        return json.loads(row[0]), row[1]
-    return {}, None
+    if not row:
+        return None, {}
+    return row[0], json.loads(row[1])
 
 
-def update_profile_workflows(profile_id, workflows):
+def write_profile(profile_id, data, n_analyzed):
     conn = sqlite3.connect(PROFILES_DB)
     c = conn.cursor()
     now = int(time.time() * 1000)
-    # Get current profile data
-    c.execute("SELECT profile_data FROM user_profiles WHERE id = ?", (profile_id,))
-    row = c.fetchone()
-    if not row:
-        conn.close()
-        return
-    data = json.loads(row[0])
-    data["workflows"] = workflows
-    c.execute("UPDATE user_profiles SET profile_data = ?, last_analyzed_at = ?, version = version + 1 WHERE id = ?",
-              (json.dumps(data), now, profile_id))
+    if profile_id is None:
+        profile_id = hashlib.sha256(str(now).encode()).hexdigest()[:16]
+        c.execute("""INSERT INTO user_profiles
+            (id, user_id, display_name, user_name, user_email, profile_data,
+             version, created_at, last_analyzed_at, total_prompts_analyzed, is_active)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (profile_id, "aizat.hawari@gmail.com", "Dr Aizat", "aizat",
+             "aizat.hawari@gmail.com", json.dumps(data),
+             1, now, now, n_analyzed, 1))
+    else:
+        c.execute("UPDATE user_profiles SET profile_data = ?, last_analyzed_at = ?, "
+                  "total_prompts_analyzed = ?, version = version + 1 WHERE id = ?",
+                  (json.dumps(data), now, n_analyzed, profile_id))
     conn.commit()
     conn.close()
+    return profile_id
 
 
-def _load_dotenv():
-    """Load .env from the script's directory if present (gitignored)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if not os.path.exists(env_path):
-        return
-    with open(env_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            key, val = key.strip(), val.strip().strip("'\"")
-            if key and key not in os.environ:
-                os.environ[key] = val
+def merge_results(merged, new, key, dedupe_field="description"):
+    if not new or key not in new:
+        return merged
+    merged.setdefault(key, [])
+    seen = {item.get(dedupe_field, "").lower() for item in merged[key]}
+    for item in new[key]:
+        d = item.get(dedupe_field, "").lower()
+        if d and d not in seen:
+            seen.add(d)
+            merged[key].append(item)
+    return merged
+
+
+def run_aspect(name, prompts, system_prompt, api_key, batch_size):
+    print(f"\n── {name} ──")
+    merged = {}
+    n_batches = (len(prompts) - 1) // batch_size + 1
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i:i + batch_size]
+        print(f"  Batch {i//batch_size + 1}/{n_batches} ({len(batch)})...", end=" ", flush=True)
+        result = call_api(batch, system_prompt, api_key)
+        if result:
+            merged = merge_results(merged, result, list(result.keys())[0])
+            n = len(list(result.values())[0])
+            print(f"✓ {n} items")
+        else:
+            print("✗ failed")
+        time.sleep(1)
+    return merged
 
 
 def main():
     _load_dotenv()
-
-    parser = argparse.ArgumentParser(description="Build user profile workflows")
-    parser.add_argument("--api-key", default="",
-                        help="DeepSeek API key (or set DEEPSEEK_API_KEY in scripts/.env)")
+    parser = argparse.ArgumentParser(description="Build user profile")
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--aspect", choices=["preferences", "patterns", "workflows", "all"],
+                        default="all", help="Which aspect to build")
     args = parser.parse_args()
 
-    # Resolve API key: flag > env var (incl .env) > OpenCode auth.json > error
-    api_key = args.api_key
+    api_key = _resolve_api_key(args.api_key)
     if not api_key:
-        api_key = os.environ.get("DEEPSEEK_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-    if not api_key:
-        auth_path = os.path.expanduser("~/.local/share/opencode/auth.json")
-        try:
-            with open(auth_path) as f:
-                auth = json.load(f)
-                api_key = auth.get("deepseek", {}).get("key", "")
-        except Exception:
-            pass
-    if not api_key:
-        print("✗ No DeepSeek API key found.")
-        print("  Create scripts/.env with: DEEPSEEK_API_KEY=sk-...")
-        print("  See scripts/.env.example for the template.")
-        return
+        print("✗ No API key. Set DEEPSEEK_API_KEY in scripts/.env or use --api-key.")
         return
 
-    prompts_rows = []
-    conn = sqlite3.connect(USER_PROMPTS_DB)
-    c = conn.cursor()
-    c.execute("SELECT id, content FROM user_prompts WHERE user_learning_captured = 0")
-    prompts_rows = c.fetchall()
-    conn.close()
+    profile_id, existing = get_active_profile()
+    print(f"Active profile: {profile_id or '(none — will create new)'}")
 
-    print(f"Loading {len(prompts_rows)} prompts...")
+    all_prompts = get_prompts()
+    print(f"Available prompts: {len(all_prompts)}")
+    if not all_prompts:
+        print("Run backfill-profile.py first to populate prompts")
+        return
 
-    # Sample across the dataset
-    step = max(1, len(prompts_rows) // 300)
-    sampled = prompts_rows[::step]
-    print(f"Sampled {len(sampled)} prompts (every {step}th)")
+    step = max(1, len(all_prompts) // 300)
+    sampled = all_prompts[::step]
+    print(f"Sampled: {len(sampled)} (every {step}th)\n")
 
-    # Get existing profile
-    existing, profile_id = get_existing_profile()
-    print(f"Existing profile id: {profile_id}, workflows: {len(existing.get('workflows',[]))}")
+    aspects = (["preferences", "patterns", "workflows"] if args.aspect == "all"
+               else [args.aspect])
+    data = {k: existing.get(k, []) for k in aspects}
 
-    all_workflows = []
-    for i in range(0, len(sampled), BATCH_SIZE):
-        batch = sampled[i:i + BATCH_SIZE]
-        print(f"  Batch {i//BATCH_SIZE + 1}/{(len(sampled)-1)//BATCH_SIZE + 1} "
-              f"({len(batch)} prompts)...", end=" ", flush=True)
-        result = call_api(batch, api_key)
-        if result and "workflows" in result:
-            wfs = result["workflows"]
-            print(f"✓ {len(wfs)} workflows")
-            all_workflows.extend(wfs)
-        else:
-            print("✗ failed")
-        time.sleep(1)
+    for aspect in aspects:
+        sys_prompt = {
+            "preferences": PREFERENCES_PROMPT,
+            "patterns":    PATTERNS_PROMPT,
+            "workflows":   WORKFLOWS_PROMPT,
+        }[aspect]
+        result = run_aspect(aspect, sampled, sys_prompt, api_key, BATCH_SIZE)
+        if result and aspect in result:
+            data[aspect] = result[aspect]
 
-    # Deduplicate by habit name
-    seen = set()
-    unique = []
-    for w in all_workflows:
-        key = w.get("habit", "").lower()[:50]
-        if key not in seen:
-            seen.add(key)
-            unique.append(w)
+    print(f"\nFinal counts:")
+    for k in ["preferences", "patterns", "workflows"]:
+        print(f"  {k:12} {len(data.get(k, []))}")
 
-    print(f"\nFinal workflows: {len(unique)}")
-    for w in unique:
-        print(f"  - {w.get('habit')} ({w.get('frequency')})")
-
-    if unique and profile_id:
-        update_profile_workflows(profile_id, unique)
-        print(f"\n✓ Updated profile {profile_id} with {len(unique)} workflows")
-    elif unique:
-        print("\n✗ No existing profile to update")
-    else:
-        print("\n✗ No workflows extracted")
+    profile_id = write_profile(profile_id, data, len(all_prompts))
+    print(f"\n✓ Profile {profile_id} written")
+    print(f"  Refresh http://127.0.0.1:4747 → User Profile tab")
 
 
 if __name__ == "__main__":

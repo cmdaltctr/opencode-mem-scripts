@@ -69,15 +69,24 @@ hasn't triggered yet, or to rebuild specific aspects of the profile.
 export DEEPSEEK_API_KEY="sk-..."
 python3 build-profile.py --api-key "sk-..."
 
-# Run — analyses prompts and writes the profile
+# Build all three aspects (preferences + patterns + workflows)
 python3 build-profile.py
+
+# Or build just one
+python3 build-profile.py --aspect preferences
+python3 build-profile.py --aspect patterns
+python3 build-profile.py --aspect workflows
 ```
 
 **What it does:**
 - Reads all unanalysed prompts from user-prompts.db
 - Samples across the dataset for diversity (every Nth prompt)
-- Batches prompts and sends them to the AI for workflow extraction
-- Deduplicates results and writes them to user-profiles.db
+- Batches prompts and sends them to the AI for extraction
+- Writes results in the plugin's expected format so the web UI renders properly:
+  - `preferences`: `{category, description, confidence}`
+  - `patterns`:    `{category, description, frequency}`
+  - `workflows`:   `{description, steps[], frequency}`
+- Deduplicates by `description` and writes to user-profiles.db
 - Uses DeepSeek V4 Flash by default (1M context); configurable via env vars
 
 ## Typical Workflow
